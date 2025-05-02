@@ -1,0 +1,101 @@
+// Intercept processes an RPC middleware interception request and returns the
+// interception result which either accepts or rejects the intercepted message.
+func (s *InterceptorService) Intercept(ctx context.Context,
+	req *lnrpc.RPCMiddlewareRequest) (*lnrpc.RPCMiddlewareResponse, error) {
+
+	// We only allow a single request or response to be handled at the same
+	// time. This should already be serialized by the RPC stream itself, but
+	// with the lock we prevent a new request to be handled before we finish
+	// handling the previous one.
+	s.requestMtx.Lock()
+	defer s.requestMtx.Unlock()
+
+	mac := &macaroon.Macaroon{}
+	err := mac.UnmarshalBinary(req.RawMacaroon)
+	if err != nil {
+		return mid.RPCErrString(req, "error parsing macaroon: %v", err)
+	}
+
+	acctID, err := accountFromMacaroon(mac)
+	if err != nil {
+		return mid.RPCErrString(
+			req, "error parsing account from macaroon: %v", err,
+		)
+	}
+
+	// No account lock in the macaroon, something's weird. The interceptor
+	// wouldn't have been triggered if there was no caveat, so we do expect
+	// a macaroon here.
+	if acctID == nil {
+		return mid.RPCErrString(req, "expected account ID in "+
+			"macaroon caveat")
+	}
+
+	acct, err := s.Account(*acctID)
+	if err != nil {
+		return mid.RPCErrString(
+			req, "error getting account %x: %v", acctID[:], err,
+		)
+	}
+
+	log.Debugf("Account auth intercepted, ID=%x, balance_sat=%d, "+
+		"expired=%v", acct.ID[:], acct.CurrentBalanceSats(),
+		acct.HasExpired())
+
+	if acct.HasExpired() {
+		return mid.RPCErrString(
+			req, "account %x has expired", acct.ID[:],
+		)
+	}
+
+	// We now add the account to the incoming context to give each checker
+	// access to it if required.
+	ctxAccount := AddToContext(ctx, KeyAccount, acct)
+
+	switch r := req.InterceptType.(type) {
+	// In the authentication phase we just check that the account hasn't
+	// expired yet (which we already did). This is only be used for
+	// establishing streams, so we don't see a request yet.
+	case *lnrpc.RPCMiddlewareRequest_StreamAuth:
+		return mid.RPCOk(req)
+
+	// Parse incoming requests and act on them.
+	case *lnrpc.RPCMiddlewareRequest_Request:
+		msg, err := parseRPCMessage(r.Request)
+		if err != nil {
+			return mid.RPCErr(req, err)
+		}
+
+		return mid.RPCErr(req, s.checkers.checkIncomingRequest(
+			ctxAccount, r.Request.MethodFullUri, msg,
+		))
+
+	// Parse and possibly manipulate outgoing responses.
+	case *lnrpc.RPCMiddlewareRequest_Response:
+		msg, err := parseRPCMessage(r.Response)
+		if err != nil {
+			return mid.RPCErr(req, err)
+		}
+
+		replacement, err := s.checkers.replaceOutgoingResponse(
+			ctxAccount, r.Response.MethodFullUri, msg,
+		)
+		if err != nil {
+			return mid.RPCErr(req, err)
+		}
+
+		// No error occurred but the response should be replaced with
+		// the given custom response. Wrap it in the correct RPC
+		// response of the interceptor now.
+		if replacement != nil {
+			return mid.RPCReplacement(req, replacement)
+		}
+
+		// No error and no replacement, just return an empty response of
+		// the correct type.
+		return mid.RPCOk(req)
+
+	default:
+		return mid.RPCErrString(req, "invalid intercept type: %v", r)
+	}
+}
